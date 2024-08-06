@@ -701,6 +701,47 @@ def job_trace_schedule(verbose, trace_format, trace_file, **args):
     job = deadline.get_job(farmId=farm_id, queueId=queue_id, jobId=job_id)
     job.pop("ResponseMetadata", None)
 
+    click.echo("Getting associated fleets from queue...")
+
+    response = deadline.list_queue_fleet_associations(farmId=farm_id, queueId=queue_id)
+    while "nextToken" in response:
+        old_list = response["queueFleetAssociations"]
+        response = deadline.list_queue_fleet_associations(
+            farmId=farm_id, queueId=queue_id, nextToken=response["nextToken"]
+        )
+        response["queueFleetAssociations"] = old_list + response["queueFleetAssociations"]
+    response.pop("ResponseMetadata", None)
+    associated_fleet_ids = list(
+        map(
+            lambda qfa: qfa["fleetId"],
+            filter(lambda qfa: qfa["status"] == "ACTIVE", response["queueFleetAssociations"]),
+        )
+    )
+
+    ebs_volumes = {}
+
+    click.echo("Getting EBS volume info...")
+
+    for fleet_id in associated_fleet_ids:
+        fleet_info = deadline.get_fleet(farmId=farm_id, fleetId=fleet_id)
+        fleet_info.pop("ResponseMetadata", None)
+
+        storageSize, iops, throughput = 0, 0, 0
+
+        for amount in fleet_info["capabilities"]["amounts"]:
+            if amount["name"] == "amount.worker.storage.root.sizegib":
+                storageSize = amount["min"]
+            elif amount["name"] == "amount.worker.storage.root.iops":
+                iops = amount["min"]
+            elif amount["name"] == "amount.worker.storage.root.throughputmib":
+                throughput = amount["min"]
+
+        ebs_volumes[fleet_id] = {
+            "storageSize": storageSize,
+            "iops": iops,
+            "throughput": throughput,
+        }
+
     click.echo("Getting all the sessions for the job...")
     response = deadline.list_sessions(farmId=farm_id, queueId=queue_id, jobId=job_id)
     while "nextToken" in response:
@@ -815,6 +856,11 @@ def job_trace_schedule(verbose, trace_format, trace_file, **args):
 
         pid = workers[session["workerId"]]
         session_event_name = f"{session['step']['name']} - {session['index']}"
+
+        get_session_response = deadline.get_session(
+            farmId=farm_id, queueId=queue_id, jobId=job_id, sessionId=session["sessionId"]
+        )
+
         trace_events.append(
             {
                 "name": session_event_name,
@@ -827,7 +873,9 @@ def job_trace_schedule(verbose, trace_format, trace_file, **args):
                     "sessionId": session["sessionId"],
                     "workerId": session["workerId"],
                     "fleetId": session["fleetId"],
+                    "stepId": session["step"]["stepId"],
                     "lifecycleStatus": session["lifecycleStatus"],
+                    "instanceType": get_session_response["hostProperties"]["ec2InstanceType"],
                 },
             }
         )
@@ -887,6 +935,14 @@ def job_trace_schedule(verbose, trace_format, trace_file, **args):
                 "ts": time_int(session["endedAt"]),
                 "pid": pid,
                 "tid": 0,
+                "args": {
+                    "sessionId": session["sessionId"],
+                    "workerId": session["workerId"],
+                    "fleetId": session["fleetId"],
+                    "stepId": session["step"]["stepId"],
+                    "lifecycleStatus": session["lifecycleStatus"],
+                    "instanceType": get_session_response["hostProperties"]["ec2InstanceType"],
+                },
             }
         )
 
@@ -956,6 +1012,7 @@ def job_trace_schedule(verbose, trace_format, trace_file, **args):
         tracing_data["otherData"]["endedAt"] = job["endedAt"].isoformat(sep="T")
 
     tracing_data["otherData"].update(accumulators)
+    tracing_data["otherData"]["ebsVolumes"] = ebs_volumes
 
     if trace_file:
         with open(trace_file, "w", encoding="utf8") as f:
